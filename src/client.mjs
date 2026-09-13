@@ -72,8 +72,18 @@ function parseSSEStream(res, provider) {
     let usage = null;
     let finishReason = 'unknown';
 
+    // Decode across chunk boundaries. `data.toString()` decodes each Buffer
+    // independently, so a multi-byte UTF-8 sequence split by TCP framing is
+    // decoded as invalid bytes on BOTH sides — one 3-byte CJK character comes
+    // out as 2~3 U+FFFD. The `buffer` line-join below does not undo it: by
+    // then the loss is already baked into a string.
+    // No flush on 'end' on purpose: the decoder holds back at most a trailing
+    // incomplete sequence, and the residual `buffer` is already discarded
+    // there, so a flush would be unobservable.
+    const decoder = new TextDecoder('utf-8');
+
     res.on('data', (data) => {
-      buffer += data.toString();
+      buffer += decoder.decode(data, { stream: true });
       const lines = buffer.split('\n');
       // Keep the last (potentially incomplete) line in the buffer
       buffer = lines.pop() || '';
@@ -235,10 +245,14 @@ export async function callModel({ provider, model, prompt, system, temperature =
           },
           (res) => {
             if (res.statusCode >= 400) {
-              let data = '';
-              res.on('data', (chunk) => (data += chunk));
+              // Same as the non-streaming path below: `data += chunk` decodes
+              // each Buffer on its own and mangles any multi-byte character
+              // split across chunks. Concat first, decode once.
+              const bufs = [];
+              res.on('data', (chunk) => bufs.push(chunk));
               res.on('error', (err) => reject(new ProviderError(err.message, 0, null, provider.id)));
               res.on('end', () => {
+                const data = Buffer.concat(bufs).toString('utf8');
                 try {
                   const json = JSON.parse(data);
                   reject(new ProviderError(json.error?.message || `HTTP ${res.statusCode}`, res.statusCode, json.error, provider.id));
@@ -285,10 +299,16 @@ export async function callModel({ provider, model, prompt, system, temperature =
           },
         },
         (res) => {
-          let data = '';
-          res.on('data', (chunk) => (data += chunk));
+          // This is the default path (`stream` defaults to false in tools.mjs).
+          // `data += chunk` is `string + Buffer`, which implicitly calls
+          // Buffer.prototype.toString() on EACH chunk: a 3-byte CJK character
+          // split by TCP framing is decoded as invalid bytes on both sides, so
+          // one character becomes 2~3 U+FFFD. Concat first, decode once.
+          const bufs = [];
+          res.on('data', (chunk) => bufs.push(chunk));
           res.on('error', (err) => reject(new ProviderError(err.message, 0, null, provider.id)));
           res.on('end', () => {
+            const data = Buffer.concat(bufs).toString('utf8');
             if (res.statusCode >= 400) {
               return reject(new ProviderError(
                 `${provider.name} API error (${res.statusCode}): ${data.slice(0, 200)}`,
