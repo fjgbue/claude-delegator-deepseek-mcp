@@ -120,23 +120,44 @@ export async function handleToolCall(name, args) {
         const contextWindow = (typeof model.context_window === 'number' && model.context_window > 0)
           ? model.context_window : 128_000;
         const maxFileBytes = Math.floor((contextWindow / 2) * 3);
-        let totalBytes = 0;
 
-        const sections = await Promise.all(
-          filePaths.map(async (p) => {
-            try {
-              const size = (await stat(p)).size;
-              if (totalBytes + size > maxFileBytes) {
-                return `### ${p}\n(skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB)`;
-              }
-              totalBytes += size;
-              const ext = extname(basename(p)).replace(/^\./, '');
-              return `### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``;
-            } catch (e) {
-              return `### ${p}\n(error: ${e.message})`;
-            }
-          })
-        );
+        // The budget used to be accumulated inside the Promise.all callbacks,
+        // AFTER `await stat(p)`. Two consequences, both silent: (a) until the
+        // stats resolved `totalBytes` was still 0, so several files could pass
+        // the check at once and the prompt could carry far more than the
+        // budget; (b) WHICH files got skipped depended on stat() completion
+        // order, not on the caller's files[] order, so the same call twice
+        // could drop different files.
+        // Fix: collect every stat first, then decide sequentially in files[]
+        // order. Skipping is now deterministic and the budget actually holds.
+        const sizes = await Promise.all(filePaths.map(async (p) => {
+          try {
+            return { p, size: (await stat(p)).size, err: null };
+          } catch (e) {
+            return { p, size: 0, err: e };
+          }
+        }));
+
+        let totalBytes = 0;
+        const sections = [];
+        for (const { p, size, err } of sizes) {
+          if (err) {
+            sections.push(`### ${p}\n(error: ${err.message})`);
+            continue;
+          }
+          if (totalBytes + size > maxFileBytes) {
+            sections.push(`### ${p}\n(skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB)`);
+            continue;
+          }
+          totalBytes += size;
+          const ext = extname(basename(p)).replace(/^\./, '');
+          try {
+            sections.push(`### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``);
+          } catch (e) {
+            totalBytes -= size;
+            sections.push(`### ${p}\n(error: ${e.message})`);
+          }
+        }
         prompt = args.prompt + '\n\n## FILES:\n\n' + sections.join('\n\n');
       }
 
