@@ -106,6 +106,48 @@ export function resolveDelegation(args, config = loadConfig()) {
   return resolveModel(spec, activeId);
 }
 
+// Fit files[] into a byte budget. Stats run in parallel, but admission is
+// decided sequentially in files[] order, so which files get dropped is the
+// same on every call. (Deciding inside the parallel callbacks made it depend
+// on stat() completion order.) A read that fails after admission refunds its
+// bytes. Returns the prompt sections plus every file that did not make it in.
+export async function readFilesWithinBudget(filePaths, maxFileBytes) {
+  const sizes = await Promise.all(filePaths.map(async (p) => {
+    try {
+      return { p, size: (await stat(p)).size, err: null };
+    } catch (e) {
+      return { p, size: 0, err: e };
+    }
+  }));
+
+  let totalBytes = 0;
+  const sections = [];
+  const dropped = [];
+  for (const { p, size, err } of sizes) {
+    if (err) {
+      sections.push(`### ${p}\n(error: ${err.message})`);
+      dropped.push({ path: p, reason: err.message });
+      continue;
+    }
+    if (totalBytes + size > maxFileBytes) {
+      const reason = `skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB`;
+      sections.push(`### ${p}\n(${reason})`);
+      dropped.push({ path: p, reason });
+      continue;
+    }
+    totalBytes += size;
+    const ext = extname(basename(p)).replace(/^\./, '');
+    try {
+      sections.push(`### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``);
+    } catch (e) {
+      totalBytes -= size;
+      sections.push(`### ${p}\n(error: ${e.message})`);
+      dropped.push({ path: p, reason: e.message });
+    }
+  }
+  return { sections, dropped };
+}
+
 export async function handleToolCall(name, args) {
   switch (ALIASES[name] || name) {
     case 'delegate': {
@@ -114,6 +156,7 @@ export async function handleToolCall(name, args) {
 
       // Read files server-side — bytes stay in the MCP process, never in Claude's context
       let prompt = args.prompt;
+      let dropped = [];
       const filePaths = Array.isArray(args.files) ? args.files.filter((p) => typeof p === 'string') : [];
       if (filePaths.length > 0) {
         // Rough guard: ~3 chars per token; leave half the context for output + prompt
@@ -121,44 +164,9 @@ export async function handleToolCall(name, args) {
           ? model.context_window : 128_000;
         const maxFileBytes = Math.floor((contextWindow / 2) * 3);
 
-        // The budget used to be accumulated inside the Promise.all callbacks,
-        // AFTER `await stat(p)`. Two consequences, both silent: (a) until the
-        // stats resolved `totalBytes` was still 0, so several files could pass
-        // the check at once and the prompt could carry far more than the
-        // budget; (b) WHICH files got skipped depended on stat() completion
-        // order, not on the caller's files[] order, so the same call twice
-        // could drop different files.
-        // Fix: collect every stat first, then decide sequentially in files[]
-        // order. Skipping is now deterministic and the budget actually holds.
-        const sizes = await Promise.all(filePaths.map(async (p) => {
-          try {
-            return { p, size: (await stat(p)).size, err: null };
-          } catch (e) {
-            return { p, size: 0, err: e };
-          }
-        }));
-
-        let totalBytes = 0;
-        const sections = [];
-        for (const { p, size, err } of sizes) {
-          if (err) {
-            sections.push(`### ${p}\n(error: ${err.message})`);
-            continue;
-          }
-          if (totalBytes + size > maxFileBytes) {
-            sections.push(`### ${p}\n(skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB)`);
-            continue;
-          }
-          totalBytes += size;
-          const ext = extname(basename(p)).replace(/^\./, '');
-          try {
-            sections.push(`### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``);
-          } catch (e) {
-            totalBytes -= size;
-            sections.push(`### ${p}\n(error: ${e.message})`);
-          }
-        }
-        prompt = args.prompt + '\n\n## FILES:\n\n' + sections.join('\n\n');
+        const files = await readFilesWithinBudget(filePaths, maxFileBytes);
+        dropped = files.dropped;
+        prompt = args.prompt + '\n\n## FILES:\n\n' + files.sections.join('\n\n');
       }
 
       const result = await callModel({
@@ -173,6 +181,13 @@ export async function handleToolCall(name, args) {
         '',
         dim('─── claude-code-deepseek-delegator'),
         `${color('green', '◆')} ${bold('delegated to')} ${color('cyan', provider.name)} ${dim('(' + model.id + (args.task ? ' · ' + args.task : '') + ')')}`,
+        // The delegate sees a note in place of each dropped file, but the
+        // caller only sees the answer. Say so here, or it reads as an answer
+        // about every file it passed.
+        ...(dropped.length > 0
+          ? [`${color('yellow', '⚠')} ${bold(`${dropped.length} of ${filePaths.length} file(s) NOT sent`)} ${dim('— answer covers the rest only')}`,
+             ...dropped.map((d) => dim(`  ${d.path}: ${d.reason}`))]
+          : []),
         '',
       ].join('\n');
 
