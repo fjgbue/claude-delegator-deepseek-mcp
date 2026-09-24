@@ -82,8 +82,14 @@ async function handle(method, id, params) {
   }
 }
 
+// Decode stdin across chunk boundaries. Same bug as client.mjs:
+// `chunk.toString()` decodes each Buffer independently, so a long non-ASCII
+// prompt split by pipe framing is corrupted ON THE WAY IN, before the model
+// ever sees it. Independent of the response-side corruption.
+const _stdinDecoder = new TextDecoder('utf-8');
+
 process.stdin.on('data', (chunk) => {
-  buffer += chunk.toString();
+  buffer += _stdinDecoder.decode(chunk, { stream: true });
   if (buffer.length > MAX_BUFFER_SIZE) {
     process.stderr.write(`WARNING: buffer exceeded ${MAX_BUFFER_SIZE} bytes — flushing to prevent memory exhaustion\n`);
     buffer = '';

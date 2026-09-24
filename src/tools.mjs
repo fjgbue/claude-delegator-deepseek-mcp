@@ -106,6 +106,48 @@ export function resolveDelegation(args, config = loadConfig()) {
   return resolveModel(spec, activeId);
 }
 
+// Fit files[] into a byte budget. Stats run in parallel, but admission is
+// decided sequentially in files[] order, so which files get dropped is the
+// same on every call. (Deciding inside the parallel callbacks made it depend
+// on stat() completion order.) A read that fails after admission refunds its
+// bytes. Returns the prompt sections plus every file that did not make it in.
+export async function readFilesWithinBudget(filePaths, maxFileBytes) {
+  const sizes = await Promise.all(filePaths.map(async (p) => {
+    try {
+      return { p, size: (await stat(p)).size, err: null };
+    } catch (e) {
+      return { p, size: 0, err: e };
+    }
+  }));
+
+  let totalBytes = 0;
+  const sections = [];
+  const dropped = [];
+  for (const { p, size, err } of sizes) {
+    if (err) {
+      sections.push(`### ${p}\n(error: ${err.message})`);
+      dropped.push({ path: p, reason: err.message });
+      continue;
+    }
+    if (totalBytes + size > maxFileBytes) {
+      const reason = `skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB`;
+      sections.push(`### ${p}\n(${reason})`);
+      dropped.push({ path: p, reason });
+      continue;
+    }
+    totalBytes += size;
+    const ext = extname(basename(p)).replace(/^\./, '');
+    try {
+      sections.push(`### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``);
+    } catch (e) {
+      totalBytes -= size;
+      sections.push(`### ${p}\n(error: ${e.message})`);
+      dropped.push({ path: p, reason: e.message });
+    }
+  }
+  return { sections, dropped };
+}
+
 export async function handleToolCall(name, args) {
   switch (ALIASES[name] || name) {
     case 'delegate': {
@@ -114,30 +156,17 @@ export async function handleToolCall(name, args) {
 
       // Read files server-side — bytes stay in the MCP process, never in Claude's context
       let prompt = args.prompt;
+      let dropped = [];
       const filePaths = Array.isArray(args.files) ? args.files.filter((p) => typeof p === 'string') : [];
       if (filePaths.length > 0) {
         // Rough guard: ~3 chars per token; leave half the context for output + prompt
         const contextWindow = (typeof model.context_window === 'number' && model.context_window > 0)
           ? model.context_window : 128_000;
         const maxFileBytes = Math.floor((contextWindow / 2) * 3);
-        let totalBytes = 0;
 
-        const sections = await Promise.all(
-          filePaths.map(async (p) => {
-            try {
-              const size = (await stat(p)).size;
-              if (totalBytes + size > maxFileBytes) {
-                return `### ${p}\n(skipped: would exceed context window — ${(size / 1024).toFixed(1)}KB)`;
-              }
-              totalBytes += size;
-              const ext = extname(basename(p)).replace(/^\./, '');
-              return `### ${p}\n\`\`\`${ext}\n${await readFile(p, 'utf8')}\n\`\`\``;
-            } catch (e) {
-              return `### ${p}\n(error: ${e.message})`;
-            }
-          })
-        );
-        prompt = args.prompt + '\n\n## FILES:\n\n' + sections.join('\n\n');
+        const files = await readFilesWithinBudget(filePaths, maxFileBytes);
+        dropped = files.dropped;
+        prompt = args.prompt + '\n\n## FILES:\n\n' + files.sections.join('\n\n');
       }
 
       const result = await callModel({
@@ -152,6 +181,13 @@ export async function handleToolCall(name, args) {
         '',
         dim('─── claude-code-deepseek-delegator'),
         `${color('green', '◆')} ${bold('delegated to')} ${color('cyan', provider.name)} ${dim('(' + model.id + (args.task ? ' · ' + args.task : '') + ')')}`,
+        // The delegate sees a note in place of each dropped file, but the
+        // caller only sees the answer. Say so here, or it reads as an answer
+        // about every file it passed.
+        ...(dropped.length > 0
+          ? [`${color('yellow', '⚠')} ${bold(`${dropped.length} of ${filePaths.length} file(s) NOT sent`)} ${dim('— answer covers the rest only')}`,
+             ...dropped.map((d) => dim(`  ${d.path}: ${d.reason}`))]
+          : []),
         '',
       ].join('\n');
 
